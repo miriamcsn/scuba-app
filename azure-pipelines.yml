@@ -1,0 +1,93 @@
+# CI do scuba divelog no NKP com Azure DevOps.
+# O agente self-hosted roda como pod no NKP (pool "nkp") e cria um pod de build que:
+# clona o repositório, procura segredos (Gitleaks), constrói, testa e publica as
+# imagens no Harbor (kaniko). Depois, o agente grava as novas tags no repositório GitOps.
+#
+# Pré-requisitos no namespace "azp":
+#   - Secret "harbor-creds" (docker-registry) com a robot account do projeto "scuba" no Harbor
+#   - Secret "github-pat" (chaves username e password) para clonar o repositório do app
+# Na pipeline: variável secreta GH_PAT, com permissão de push no repositório GitOps.
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    exclude: ['*.md', 'docs/*']
+
+pool:
+  name: nkp
+
+variables:
+  HARBOR: <HARBOR_HOST>/scuba
+  APP_REPO: github.com/miriamcsn/scuba-app.git
+  GITOPS_REPO: github.com/miriamcsn/scuba-gitops.git
+  GH_USER: miriamcsn
+
+steps:
+  - checkout: self
+
+  - bash: |
+      set -e
+      SHA=$(git rev-parse HEAD); TAG=${SHA:0:7}; POD=ci-$(Build.BuildId)
+      cat <<EOF | kubectl -n azp apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: $POD
+      spec:
+        restartPolicy: Never
+        volumes:
+          - name: ws
+            emptyDir: {}
+          - name: harbor-creds
+            secret:
+              secretName: harbor-creds
+              items:
+                - key: .dockerconfigjson
+                  path: config.json
+        initContainers:
+          - name: clonar
+            image: alpine/git:latest
+            command: ["sh", "-c"]
+            args: ["git clone https://\$GIT_USERNAME:\$GIT_PASSWORD@$(APP_REPO) /ws/src && git -C /ws/src checkout $SHA"]
+            env:
+              - name: GIT_USERNAME
+                valueFrom: {secretKeyRef: {name: github-pat, key: username}}
+              - name: GIT_PASSWORD
+                valueFrom: {secretKeyRef: {name: github-pat, key: password}}
+            volumeMounts: [{name: ws, mountPath: /ws}]
+          - name: segredos-gitleaks
+            image: ghcr.io/gitleaks/gitleaks:latest
+            args: ["dir", "--redact", "-v", "/ws/src"]
+            volumeMounts: [{name: ws, mountPath: /ws}]
+          - name: backend-build-testes-publicacao
+            image: ghcr.io/osscontainertools/kaniko:latest
+            args: ["--context=dir:///ws/src/backend", "--dockerfile=/ws/src/backend/Dockerfile", "--destination=$(HARBOR)/scuba-backend:$TAG"]
+            volumeMounts:
+              - {name: ws, mountPath: /ws}
+              - {name: harbor-creds, mountPath: /kaniko/.docker}
+        containers:
+          - name: frontend-build-publicacao
+            image: ghcr.io/osscontainertools/kaniko:latest
+            args: ["--context=dir:///ws/src/frontend", "--dockerfile=/ws/src/frontend/Dockerfile", "--destination=$(HARBOR)/scuba-frontend:$TAG"]
+            volumeMounts:
+              - {name: ws, mountPath: /ws}
+              - {name: harbor-creds, mountPath: /kaniko/.docker}
+      EOF
+      for i in $(seq 1 120); do
+        PHASE=$(kubectl -n azp get pod $POD -o jsonpath='{.status.phase}')
+        [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "Failed" ] && break
+        sleep 10
+      done
+      # Mostra o log de cada etapa (o prefixo indica em qual barreira o build parou)
+      kubectl -n azp logs $POD --all-containers --prefix || true
+      kubectl -n azp delete pod $POD --wait=false
+      [ "$PHASE" = "Succeeded" ]
+      echo "##vso[task.setvariable variable=TAG]$TAG"
+    displayName: CI - segredos, build com testes e publicação no Harbor
+
+  - bash: |
+      GITOPS_URL="https://$(GH_USER):$GH_PAT@$(GITOPS_REPO)" CI_NAME=azure-pipelines sh ci/update-gitops.sh "$(TAG)"
+    displayName: Atualizar tags no repositório GitOps
+    env:
+      GH_PAT: $(GH_PAT)

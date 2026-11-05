@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.db
+
+# Contexto local do Claude Code (não versionar)
+CLAUDE.md
+.claude/
